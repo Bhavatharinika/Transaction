@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import random
+import statistics
 import time
 import uuid
 from datetime import datetime, timezone
@@ -225,9 +226,11 @@ async def wait_for_completion(
     took = time.perf_counter() - t0
 
     return {
+        "submitted": len(unique_ids),
         "completed": completed,
         "failed": failed,
         "unfinished": unfinished,
+        "invariantHolds": completed + failed + unfinished == len(unique_ids),
         "secondsFromStart": round(took, 1),
         "completionRatePerSecond": (
             round(completed / took, 2)

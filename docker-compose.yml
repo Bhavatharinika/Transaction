@@ -82,7 +82,7 @@ services:
       DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
     ports: ["8000:8000"]
-    tmpfs: ["/tmp/prom"]
+    tmpfs: ["/tmp/prom:mode=1777"]
     depends_on:
       migrate: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
