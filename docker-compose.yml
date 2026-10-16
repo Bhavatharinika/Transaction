@@ -1,0 +1,131 @@
+# docker compose up --build        -> full system (UI :3000, API :8000, mock posting service :8080)
+# docker compose --profile test run --rm tests   -> unit + integration tests
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tps}:${POSTGRES_PASSWORD:-tps-local-dev}@postgres:5432/${POSTGRES_DB:-tps}
+  REDIS_URL: redis://redis:6379/0
+  MOCK_SERVICE_URL: http://mock-posting-service:8080
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
+  QUEUE_MAX_DEPTH: ${QUEUE_MAX_DEPTH:-50000}
+  MAX_OPEN_TRANSACTIONS: ${MAX_OPEN_TRANSACTIONS:-200000}
+  RETRY_AFTER_SECONDS: ${RETRY_AFTER_SECONDS:-5}
+  LEASE_TTL_SECONDS: ${LEASE_TTL_SECONDS:-10}
+  LEASE_HEARTBEAT_SECONDS: ${LEASE_HEARTBEAT_SECONDS:-3}
+  RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-1.0}
+  RECONCILE_BATCH_SIZE: ${RECONCILE_BATCH_SIZE:-500}
+  REQUEUE_AFTER_SECONDS: ${REQUEUE_AFTER_SECONDS:-20}
+  SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-30}
+  MOCK_CONNECT_TIMEOUT_SECONDS: ${MOCK_CONNECT_TIMEOUT_SECONDS:-3}
+  MOCK_GET_TIMEOUT_SECONDS: ${MOCK_GET_TIMEOUT_SECONDS:-5}
+  MOCK_POST_TIMEOUT_SECONDS: ${MOCK_POST_TIMEOUT_SECONDS:-15}
+  MOCK_MAX_CONNECTIONS: ${MOCK_MAX_CONNECTIONS:-200}
+  VERIFICATION_SETTLE_SECONDS: ${VERIFICATION_SETTLE_SECONDS:-12}
+  RETRY_MAX_RETRIES: ${RETRY_MAX_RETRIES:-5}
+  RETRY_INITIAL_DELAY_SECONDS: ${RETRY_INITIAL_DELAY_SECONDS:-1}
+  RETRY_MAX_DELAY_SECONDS: ${RETRY_MAX_DELAY_SECONDS:-60}
+  RETRY_JITTER_RATIO: ${RETRY_JITTER_RATIO:-0.2}
+  CIRCUIT_WINDOW_SIZE: ${CIRCUIT_WINDOW_SIZE:-20}
+  CIRCUIT_MIN_CALLS: ${CIRCUIT_MIN_CALLS:-10}
+  CIRCUIT_FAILURE_RATIO: ${CIRCUIT_FAILURE_RATIO:-0.5}
+  CIRCUIT_OPEN_SECONDS: ${CIRCUIT_OPEN_SECONDS:-15}
+  CIRCUIT_HALF_OPEN_MAX_CALLS: ${CIRCUIT_HALF_OPEN_MAX_CALLS:-3}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tps}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tps-local-dev}
+      POSTGRES_DB: ${POSTGRES_DB:-tps}
+    command: ["postgres", "-c", "max_connections=300", "-c", "synchronous_commit=on"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tps} -d ${POSTGRES_DB:-tps}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # AOF so queued messages survive a Redis restart; PostgreSQL remains the source of truth regardless.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes: [redisdata:/data]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # The provided external dependency. Used unmodified, exactly as in the exercise instructions.
+  mock-posting-service:
+    image: vinhopenfabric/mock-posting-service:latest
+    ports: ["8081:8080"]
+
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  api:
+    build: ./backend
+    command: ["sh", "-c", "rm -rf $$PROMETHEUS_MULTIPROC_DIR/* && uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers $${API_WORKERS:-4} --no-access-log"]
+    environment:
+      <<: *backend-env
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prom
+      API_WORKERS: ${API_WORKERS:-4}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+    ports: ["8000:8000"]
+    tmpfs: ["/tmp/prom"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.workers.runner"]
+    environment:
+      <<: *backend-env
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-150}
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+    stop_grace_period: 40s   # > SHUTDOWN_GRACE_SECONDS so in-flight POSTs can drain
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      mock-posting-service: {condition: service_started}
+
+  frontend:
+    build: ./frontend
+    ports: ["3000:80"]
+    depends_on: [api]
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: ./backend
+      args: {INSTALL_DEV: "true"}
+    command: ["pytest", "-v", "-m", "not mock_service"]
+    environment:
+      <<: *backend-env
+      TEST_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tps}:${POSTGRES_PASSWORD:-tps-local-dev}@postgres:5432/tps_test
+      TEST_REDIS_URL: redis://redis:6379/15
+      MOCK_SERVICE_URL: http://mock-posting-service:8080
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+volumes:
+  pgdata:
+  redisdata:
